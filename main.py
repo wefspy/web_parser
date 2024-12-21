@@ -1,14 +1,14 @@
 import asyncio
-from typing import Annotated, Type, Sequence, Dict
+from contextlib import asynccontextmanager
+from typing import Annotated, Sequence
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import Depends, FastAPI, HTTPException, Body
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
-from starlette.responses import JSONResponse
 
 sqlite_file_name = "database.db"
 sqlite_url = f"sqlite+aiosqlite:///{sqlite_file_name}"
@@ -22,6 +22,11 @@ async def create_db_and_tables():
 
 
 async def get_session() -> AsyncSession:
+    async with AsyncSession(engine) as session:
+        yield session
+
+@asynccontextmanager
+async def get_session_cm() -> AsyncSession:
     async with AsyncSession(engine) as session:
         yield session
 
@@ -41,24 +46,11 @@ class Product(BaseModel):
 
 
 BASE_URL = 'https://www.maxidom.ru/'
-
-
-async def get_urls():
-    categories_url = BASE_URL + 'catalog/'
-    hrefs: list[str] = []
-    async with httpx.AsyncClient() as client:
-        response = await client.get(categories_url)
-        soup: BeautifulSoup = BeautifulSoup(response.content, "lxml")
-        divs = soup.find_all("div", class_="lvl0-elem__menu")
-        for div in divs:
-            links = div.find_all('a')
-            hrefs = hrefs + [BASE_URL + link['href'] for link in links if 'href' in link.attrs]
-    return hrefs
+CATEGORY_URL = "https://www.maxidom.ru/catalog/sadovaya-tehnika/"
 
 
 async def get_products(url: str) -> list[Product]:
     products: list[Product] = []
-    print(url)
     async with httpx.AsyncClient() as client:
         while url:
             response = await client.get(url)
@@ -90,8 +82,9 @@ async def on_startup():
 
 async def update_all_products_everyday():
     while True:
-        await update_all_products(get_session())
-        await asyncio.sleep(60 * 60 * 24) # 1 день
+        async with get_session_cm() as session:
+            await update_product_category(session)
+        await asyncio.sleep(60 * 60 * 24)
 
 
 @app.post("/products/")
@@ -100,7 +93,7 @@ async def create_product(product: Product, session: SessionDep) -> ProductEntity
     session.add(db_product)
     await session.commit()
     await session.refresh(db_product)
-    return product
+    return db_product
 
 
 @app.get("/products/{offset}/{limit}")
@@ -122,7 +115,7 @@ async def read_products_limit(session: SessionDep) -> Sequence[ProductEntity]:
 
 
 @app.get("/products/{product_id}")
-async def read_product(product_id: int, session: SessionDep) -> dict[str, str] | Type[ProductEntity]:
+async def read_product(product_id: int, session: SessionDep) -> dict[str, str] | ProductEntity:
     product = await session.get(ProductEntity, product_id)
     if not product:
         return {"message": "Product not found"}
@@ -139,26 +132,20 @@ async def delete_product(product_id: int, session: SessionDep):
     return {"ok": True}
 
 
-@app.put("/update_all_products/")
-async def update_all_products(session: SessionDep):
-    urls = await get_urls()
-    products = []
-
-    for url in urls:
-        new_products = await get_products(url)
-        products += new_products
-
-    await update_products_db(session, products)
-
-    await session.commit()
-    return {"ok": True, "updated_products": len(products)}
-
-
-@app.put("/update_products_category/")
-async def update_product_category(session: SessionDep, url: str):
-    if not (url.startswith(BASE_URL)):
+@app.put("/products/category/url")
+async def set_url(session: SessionDep, url: str):
+    global CATEGORY_URL
+    if not url.startswith(BASE_URL):
         return {"message": "Incorrect URL"}
-    products = await get_products(url)
+
+    CATEGORY_URL = url
+
+    return {"ok": True, "updated_url": CATEGORY_URL}
+
+
+@app.put("/products/category")
+async def update_product_category(session: SessionDep):
+    products = await get_products(CATEGORY_URL)
 
     await update_products_db(session, products)
 
