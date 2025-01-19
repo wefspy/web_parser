@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 sqlite_file_name = "database.db"
 sqlite_url = f"sqlite+aiosqlite:///{sqlite_file_name}"
@@ -71,6 +72,27 @@ async def get_products(url: str) -> list[Product]:
     return products
 
 
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+
+
+manager = ConnectionManager()
 app = FastAPI()
 
 
@@ -87,13 +109,14 @@ async def update_all_products_everyday():
         await asyncio.sleep(60 * 60 * 24)
 
 
-@app.post("/products/")
-async def create_product(product: Product, session: SessionDep) -> ProductEntity:
-    db_product = ProductEntity(name=product.name, price=product.price)
-    session.add(db_product)
-    await session.commit()
-    await session.refresh(db_product)
-    return db_product
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 @app.get("/products/{offset}/{limit}")
@@ -122,6 +145,17 @@ async def read_product(product_id: int, session: SessionDep) -> dict[str, str] |
     return product
 
 
+@app.post("/products/")
+async def create_product(product: Product, session: SessionDep) -> ProductEntity:
+    db_product = ProductEntity(name=product.name, price=product.price)
+    session.add(db_product)
+    await session.commit()
+    await session.refresh(db_product)
+
+    await manager.broadcast(f"Post product {db_product}")
+    return db_product
+
+
 @app.delete("/products/{product_id}")
 async def delete_product(product_id: int, session: SessionDep):
     product = await session.get(ProductEntity, product_id)
@@ -129,6 +163,8 @@ async def delete_product(product_id: int, session: SessionDep):
         return {"message": "Product not found"}
     await session.delete(product)
     await session.commit()
+
+    await manager.broadcast(f"Delete product {product}")
     return {"ok": True}
 
 
@@ -140,15 +176,16 @@ async def set_url(session: SessionDep, url: str):
 
     CATEGORY_URL = url
 
+    await manager.broadcast(f"Set category URL {CATEGORY_URL}")
     return {"ok": True, "updated_url": CATEGORY_URL}
 
 
 @app.put("/products/category")
 async def update_product_category(session: SessionDep):
     products = await get_products(CATEGORY_URL)
-
     await update_products_db(session, products)
 
+    await manager.broadcast(f"Put products by {CATEGORY_URL}")
     return {"ok": True, "updated_products": len(products)}
 
 
@@ -183,4 +220,5 @@ async def update_product(
     await session.commit()
     await session.refresh(db_product)
 
+    await manager.broadcast(f"Post product {db_product}")
     return db_product
